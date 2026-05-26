@@ -5,42 +5,74 @@ import urllib.request
 import os
 import random
 
-SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","DOGEUSDT","BNBUSDT","XRPUSDT","ADAUSDT","AVAXUSDT"]
-TIMEFRAMES = [("15M","15m"),("1H","1h")]
+SYMBOLS = [
+    ("BTC","BTC-USDT-SWAP","bitcoin"),
+    ("ETH","ETH-USDT-SWAP","ethereum"),
+    ("SOL","SOL-USDT-SWAP","solana"),
+    ("DOGE","DOGE-USDT-SWAP","dogecoin"),
+    ("BNB","BNB-USDT-SWAP","binancecoin"),
+    ("XRP","XRP-USDT-SWAP","ripple"),
+    ("ADA","ADA-USDT-SWAP","cardano"),
+    ("AVAX","AVAX-USDT-SWAP","avalanche-2"),
+]
+TIMEFRAMES = [("15M","15m"),("1H","1H")]
 OUTPUT_FILE = "public/signals.json"
 
 def fetch(url):
     try:
         req = urllib.request.Request(url, headers={"User-Agent":"Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with urllib.request.urlopen(req, timeout=15) as r:
             return json.loads(r.read())
     except Exception as e:
-        print("  error: " + str(e))
+        print("  err: " + str(e)[:60])
         return None
 
-def get_price(sym):
-    d = fetch("https://api.binance.com/api/v3/ticker/price?symbol=" + sym)
-    return float(d["price"]) if d else 0.0
+def get_price(sym_okx):
+    d = fetch("https://www.okx.com/api/v5/market/ticker?instId=" + sym_okx)
+    if d and d.get("data"):
+        return float(d["data"][0]["last"])
+    return 0.0
 
-def get_funding(sym):
-    d = fetch("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=" + sym)
-    return round(float(d["lastFundingRate"]) * 100, 4) if d else 0.0
+def get_funding(sym_okx):
+    d = fetch("https://www.okx.com/api/v5/public/funding-rate?instId=" + sym_okx)
+    if d and d.get("data"):
+        return round(float(d["data"][0]["fundingRate"]) * 100, 4)
+    return 0.0
 
-def get_lsr(sym):
-    d = fetch("https://fapi.binance.com/futures/data/topLongShortPositionRatio?symbol=" + sym + "&period=5m&limit=1")
-    return round(float(d[0]["longShortRatio"]), 2) if d and len(d) > 0 else 1.0
+def get_oi(sym_okx):
+    d = fetch("https://www.okx.com/api/v5/rubik/stat/contracts/open-interest-volume?ccy=" + sym_okx.split("-")[0] + "&period=5m")
+    if d and d.get("data") and len(d["data"]) > 0:
+        try:
+            return round(float(d["data"][0][1]) / 1000000, 2)
+        except Exception:
+            return 0.0
+    return 0.0
 
-def get_oi(sym):
-    d = fetch("https://fapi.binance.com/fapi/v1/openInterest?symbol=" + sym)
-    return round(float(d["openInterest"]) / 1000000, 2) if d else 0.0
+def get_lsr(sym_okx):
+    ccy = sym_okx.split("-")[0]
+    d = fetch("https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio?ccy=" + ccy + "&period=5m")
+    if d and d.get("data") and len(d["data"]) > 0:
+        try:
+            return round(float(d["data"][0][1]), 2)
+        except Exception:
+            return 1.0
+    return 1.0
 
-def get_klines(sym, interval):
-    d = fetch("https://fapi.binance.com/fapi/v1/klines?symbol=" + sym + "&interval=" + interval + "&limit=50")
-    if not d:
+def get_klines(sym_okx, bar):
+    d = fetch("https://www.okx.com/api/v5/market/candles?instId=" + sym_okx + "&bar=" + bar + "&limit=50")
+    if not d or not d.get("data"):
         return []
     result = []
-    for c in d:
-        result.append({"h": float(c[2]), "l": float(c[3]), "c": float(c[4]), "v": float(c[5])})
+    for c in d["data"]:
+        try:
+            result.append({
+                "h": float(c[2]),
+                "l": float(c[3]),
+                "c": float(c[4]),
+                "v": float(c[5]),
+            })
+        except Exception:
+            pass
     return result
 
 def calc_atr(candles):
@@ -71,13 +103,13 @@ def calc_rsi(candles):
         return 100
     return round(100 - 100 / (1 + ag / al), 1)
 
-def analyze(sym, tf_label, tf_bin):
-    print("  " + sym + " " + tf_label, end=" ")
-    price = get_price(sym)
-    funding = get_funding(sym)
-    lsr = get_lsr(sym)
-    oi = get_oi(sym)
-    candles = get_klines(sym, tf_bin)
+def analyze(name, sym_okx, tf_label, tf_bar):
+    print("  " + name + " " + tf_label, end=" ")
+    price = get_price(sym_okx)
+    funding = get_funding(sym_okx)
+    lsr = get_lsr(sym_okx)
+    oi = get_oi(sym_okx)
+    candles = get_klines(sym_okx, tf_bar)
 
     if not candles or price == 0:
         print("-> skip")
@@ -139,11 +171,11 @@ def analyze(sym, tf_label, tf_bin):
         role = random.choice(short_roles)
 
     now_str = datetime.datetime.utcnow().strftime("%Y/%m/%d %H:%M")
-    print("-> " + direction)
+    print("-> " + direction + " RSI:" + str(rsi_val) + " Fund:" + str(funding))
 
     return {
-        "id": sym + "-" + tf_label + "-" + str(int(time.time())),
-        "symbol": sym.replace("USDT", ""),
+        "id": name + "-" + tf_label + "-" + str(int(time.time())),
+        "symbol": name,
         "timeframe": tf_label,
         "direction": direction,
         "role": role,
@@ -171,7 +203,13 @@ def analyze(sym, tf_label, tf_bin):
     }
 
 def update_pnl(sig):
-    p = get_price(sig["symbol"] + "USDT")
+    sym_map = {
+        "BTC":"BTC-USDT-SWAP","ETH":"ETH-USDT-SWAP","SOL":"SOL-USDT-SWAP",
+        "DOGE":"DOGE-USDT-SWAP","BNB":"BNB-USDT-SWAP","XRP":"XRP-USDT-SWAP",
+        "ADA":"ADA-USDT-SWAP","AVAX":"AVAX-USDT-SWAP",
+    }
+    okx_sym = sym_map.get(sig["symbol"], sig["symbol"] + "-USDT-SWAP")
+    p = get_price(okx_sym)
     if not p:
         return sig
     sig["current"] = p
@@ -214,7 +252,6 @@ def save(signals):
 
 def main():
     print("Sentiment Lens - " + datetime.datetime.utcnow().strftime("%Y/%m/%d %H:%M") + " UTC")
-
     existing = load()
     cutoff = int(time.time()) - 48 * 3600
     updated = []
@@ -230,19 +267,19 @@ def main():
     new_sigs = []
     dedup_cutoff = int(time.time()) - 3600
 
-    for sym in SYMBOLS:
-        for tf_label, tf_bin in TIMEFRAMES:
+    for name, sym_okx, _ in SYMBOLS:
+        for tf_label, tf_bar in TIMEFRAMES:
             skip = False
             for s in updated:
-                if s["symbol"] == sym.replace("USDT","") and s["timeframe"] == tf_label and s.get("timestamp",0) > dedup_cutoff:
+                if s["symbol"] == name and s["timeframe"] == tf_label and s.get("timestamp", 0) > dedup_cutoff:
                     skip = True
                     break
             if skip:
                 continue
-            sig = analyze(sym, tf_label, tf_bin)
+            sig = analyze(name, sym_okx, tf_label, tf_bar)
             if sig:
                 new_sigs.append(sig)
-            time.sleep(0.3)
+            time.sleep(0.5)
 
     all_sigs = new_sigs + updated
     all_sigs.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
