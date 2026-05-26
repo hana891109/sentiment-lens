@@ -16,10 +16,10 @@ SYMBOLS = [
 TIMEFRAMES = [("15M", "15m"), ("1H", "1h")]
 
 CONFIG = {
-    "lsr_long_threshold":   1.10,
-    "lsr_short_threshold":  0.90,
-    "funding_long":        -0.01,
-    "funding_short":        0.01,
+    "lsr_long_threshold":   2.00,
+    "lsr_short_threshold":  0.50,
+    "funding_long":        -0.001,
+    "funding_short":        0.001,
     "atr_sl_multiplier":    1.5,
     "tp_ratios":         [1, 2, 3, 5],
     "max_signals":          50,
