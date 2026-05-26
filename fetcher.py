@@ -130,8 +130,8 @@ def analyze(sym, tf_label, tf_bin):
 
     print(f"L:{ls} S:{ss}", end=" ")
 
-    if ls < 3 and ss < 3:
-        print("→ 條件不足")
+if ls < 1 and ss < 1:
+        print(f"→ 條件不足")
         return None
 
     direction = "LONG" if ls >= ss else "SHORT"
