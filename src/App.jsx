@@ -402,7 +402,10 @@ export default function App() {
   const loadSignals = useCallback(async () => {
     try {
       // signals.json は同じフォルダに置く
-      const res = await fetch("https://sentiment-lens-0l66.onrender.com/signals?" + Date.now());
+      const res = await fetch("https://sentiment-lens-0l66.onrender.com/signals?" + Date.now(), {
+  mode: "cors",
+  headers: { "Accept": "application/json" }
+});
       if (!res.ok) throw new Error("signals.json が見つかりません");
       const data = await res.json();
       setSignals(data.signals || []);
