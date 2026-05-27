@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: sentiment-lens-api
+    env: python
+    buildCommand: echo "ready"
+    startCommand: python server.py
+    plan: free
