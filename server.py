@@ -253,6 +253,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type","application/json; charset=utf-8")
             self.send_header("Access-Control-Allow-Origin","*")
+            self.send_header("Access-Control-Allow-Headers","*")
             self.send_header("Content-Length",str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -261,10 +262,11 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_response(404); self.end_headers()
     def do_OPTIONS(self):
-        self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin","*")
-        self.send_header("Access-Control-Allow-Methods","GET, OPTIONS")
-        self.end_headers()
+    self.send_response(200)
+    self.send_header("Access-Control-Allow-Origin","*")
+    self.send_header("Access-Control-Allow-Methods","GET, OPTIONS")
+    self.send_header("Access-Control-Allow-Headers","*")
+    self.end_headers()
 
 class ThreadedServer(socketserver.ThreadingMixIn, HTTPServer): pass
 
