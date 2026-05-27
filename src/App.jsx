@@ -402,7 +402,7 @@ export default function App() {
   const loadSignals = useCallback(async () => {
     try {
       // signals.json は同じフォルダに置く
-      const res = await fetch("./signals.json?" + Date.now());
+      const res = await fetch("https://sentiment-lens-api.onrender.com/signals?" + Date.now());
       if (!res.ok) throw new Error("signals.json が見つかりません");
       const data = await res.json();
       setSignals(data.signals || []);
