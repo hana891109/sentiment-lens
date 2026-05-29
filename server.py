@@ -32,12 +32,12 @@ SYMBOLS = [
 
 TIMEFRAMES     = [("15M","15m"), ("1H","1H")]
 SCAN_INTERVAL  = 30        # 每30秒掃描
-DEDUP_SECONDS  = 7200      # 同幣同週期2小時不重複
+DEDUP_SECONDS  = 14400     # 同幣同週期4小時不重複
 MAX_SIGNALS    = 200       # 最多保留筆數
 SIGNAL_TTL     = 7 * 24 * 3600  # 保留7天
-MIN_SCORE      = 5         # 最低觸發分數
-MIN_RISK_PCT   = 2.0       # 最小R值%（太小不做）
-MIN_SL_PCT     = 0.025     # SL最小距離（價格的2.5%）
+MIN_SCORE      = 7         # 最低觸發分數（精準模式）
+MIN_RISK_PCT   = 2.5       # 最小R值%（太小不做）
+MIN_SL_PCT     = 0.03     # SL最小距離（價格的2.5%）
 
 signals_store = []
 store_lock    = threading.Lock()
@@ -292,8 +292,8 @@ def get_symbol_winrate(all_signals, symbol, direction):
 # 核心訊號分析
 # ═══════════════════════════════════════════════════════════
 ROLES = {
-    "LONG":  ["獵頭者","先鋒者","衝鋒者"],
-    "SHORT": ["沉思者","獵空者","伏擊者"],
+    "LONG":  ["獵頭者"],
+    "SHORT": ["沉思者"],
 }
 
 def analyze(name, sym, tf_label, tf_bar, all_signals):
