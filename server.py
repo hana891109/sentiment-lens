@@ -1,11 +1,8 @@
 """
-Sentiment Lens - 完整優化版
-根據 Trader-Alex 影片邏輯重新設計：
-- 1H/4H/1D 三燈系統判斷大方向
-- 只做順勢訊號（影片核心原則）
-- R值保護（最小 2.5%）
-- 每個幣種歷史勝率追蹤
-- 目標勝率 70%、FTP 達成率 40%
+Sentiment Lens - 合併版伺服器
+波段訊號：/signals
+日內訊號：/intraday
+同一個 Render 服務，兩個獨立掃描引擎
 """
 
 import json
@@ -19,7 +16,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import socketserver
 
 # ═══════════════════════════════════════════════════════════
-# 設定區
+# 共用設定
 # ═══════════════════════════════════════════════════════════
 SYMBOLS = [
     ("BTC","BTC-USDT-SWAP"),("ETH","ETH-USDT-SWAP"),("SOL","SOL-USDT-SWAP"),
@@ -30,22 +27,38 @@ SYMBOLS = [
     ("INJ","INJ-USDT-SWAP"),("FIL","FIL-USDT-SWAP"),("ATOM","ATOM-USDT-SWAP"),
 ]
 
-TIMEFRAMES     = [("15M","15m"), ("1H","1H")]
-SCAN_INTERVAL  = 30        # 每30秒掃描
-DEDUP_SECONDS  = 14400     # 同幣同週期4小時不重複
-MAX_SIGNALS    = 200       # 最多保留筆數
-SIGNAL_TTL     = 7 * 24 * 3600  # 保留7天
-MIN_SCORE      = 7         # 最低觸發分數（精準模式）
-MIN_RISK_PCT   = 2.5       # 最小R值%（太小不做）
-MIN_SL_PCT     = 0.03     # SL最小距離（價格的2.5%）
-
-signals_store = []
-store_lock    = threading.Lock()
-last_update   = ""
-
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPO  = os.environ.get("GITHUB_REPO", "")
 RENDER_URL   = os.environ.get("RENDER_URL", "")
+
+# ─── 波段設定 ──────────────────────────────────────────────
+SWING_TIMEFRAMES   = [("15M","15m"),("1H","1H")]
+SWING_SCAN         = 60        # 每60秒掃描
+SWING_DEDUP        = 14400     # 4小時去重
+SWING_MAX          = 200
+SWING_TTL          = 7*24*3600
+SWING_MIN_SCORE    = 7
+SWING_MIN_RISK     = 2.5
+SWING_MIN_SL       = 0.03
+
+# ─── 日內設定 ──────────────────────────────────────────────
+INTRADAY_MODES = [
+    ("超短線","1m","3m",  5,  0.5, 0.8),
+    ("短線",  "5m","15m", 20, 1.0, 1.2),
+    ("半日",  "15m","30m",60, 1.5, 1.8),
+]
+INTRADAY_SCAN  = 30
+INTRADAY_MAX   = 300
+INTRADAY_TTL   = 1*24*3600
+INTRADAY_MIN_SCORE = 5
+
+# ─── 全域儲存 ──────────────────────────────────────────────
+swing_store    = []
+intraday_store = []
+swing_lock     = threading.Lock()
+intraday_lock  = threading.Lock()
+swing_update   = ""
+intraday_update= ""
 
 # ═══════════════════════════════════════════════════════════
 # 時區工具
@@ -63,25 +76,21 @@ def tw_hour():
 
 def get_session():
     h = tw_hour()
-    if 8 <= h < 16:
-        return "亞洲盤", "medium"
-    elif 15 <= h < 22:
-        return "歐洲盤", "high"
-    elif 20 <= h <= 23 or 0 <= h < 4:
-        return "美洲盤", "high"
-    else:
-        return "離市時段", "low"
+    if 8 <= h < 16:    return "亞洲盤", "medium"
+    elif 15 <= h < 22: return "歐洲盤", "high"
+    elif 20 <= h <= 23 or 0 <= h < 4: return "美洲盤", "high"
+    else: return "離市時段", "low"
 
 # ═══════════════════════════════════════════════════════════
 # HTTP 工具
 # ═══════════════════════════════════════════════════════════
 def fetch(url):
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        req = urllib.request.Request(url, headers={"User-Agent":"Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=12) as r:
             return json.loads(r.read())
     except Exception as e:
-        print("  fetch err: " + str(e)[:50])
+        print("  err:" + str(e)[:50])
         return None
 
 # ═══════════════════════════════════════════════════════════
@@ -96,740 +105,689 @@ def get_price(sym):
 def get_funding(sym):
     d = fetch("https://www.okx.com/api/v5/public/funding-rate?instId=" + sym)
     if d and d.get("data"):
-        return round(float(d["data"][0]["fundingRate"]) * 100, 4)
+        return round(float(d["data"][0]["fundingRate"])*100, 4)
     return 0.0
 
 def get_lsr(sym):
     ccy = sym.split("-")[0]
-    d = fetch("https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio?ccy=" + ccy + "&period=5m")
-    if d and d.get("data") and len(d["data"]) > 0:
-        try:
-            return round(float(d["data"][0][1]), 2)
-        except Exception:
-            return 1.0
+    d = fetch("https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio?ccy="+ccy+"&period=5m")
+    if d and d.get("data") and len(d["data"])>0:
+        try: return round(float(d["data"][0][1]),2)
+        except: return 1.0
     return 1.0
 
 def get_oi(sym):
     ccy = sym.split("-")[0]
-    d = fetch("https://www.okx.com/api/v5/rubik/stat/contracts/open-interest-volume?ccy=" + ccy + "&period=5m")
-    if d and d.get("data") and len(d["data"]) > 0:
-        try:
-            return round(float(d["data"][0][1]) / 1000000, 2)
-        except Exception:
-            return 0.0
+    d = fetch("https://www.okx.com/api/v5/rubik/stat/contracts/open-interest-volume?ccy="+ccy+"&period=5m")
+    if d and d.get("data") and len(d["data"])>0:
+        try: return round(float(d["data"][0][1])/1000000,2)
+        except: return 0.0
     return 0.0
 
 def get_klines(sym, bar, limit=150):
-    d = fetch("https://www.okx.com/api/v5/market/candles?instId=" + sym
-              + "&bar=" + bar + "&limit=" + str(limit))
-    if not d or not d.get("data"):
-        return []
+    d = fetch("https://www.okx.com/api/v5/market/candles?instId="+sym+"&bar="+bar+"&limit="+str(limit))
+    if not d or not d.get("data"): return []
     result = []
     for c in reversed(d["data"]):
         try:
             result.append({
-                "h": float(c[2]), "l": float(c[3]),
-                "c": float(c[4]), "v": float(c[5]),
+                "h":float(c[2]),"l":float(c[3]),
+                "c":float(c[4]),"v":float(c[5]),
             })
-        except Exception:
-            pass
+        except: pass
     return result
 
 # ═══════════════════════════════════════════════════════════
-# 技術指標
+# 技術指標（共用）
 # ═══════════════════════════════════════════════════════════
 def calc_atr(candles, n=14):
-    if len(candles) < n + 1:
-        return 0.0
-    trs = []
-    for i in range(1, len(candles)):
-        trs.append(max(
-            candles[i]["h"] - candles[i]["l"],
-            abs(candles[i]["h"] - candles[i-1]["c"]),
-            abs(candles[i]["l"] - candles[i-1]["c"]),
-        ))
+    if len(candles)<n+1: return 0.0
+    trs = [max(candles[i]["h"]-candles[i]["l"],
+               abs(candles[i]["h"]-candles[i-1]["c"]),
+               abs(candles[i]["l"]-candles[i-1]["c"]))
+           for i in range(1,len(candles))]
     vals = trs[-n:]
-    return sum(vals) / len(vals) if vals else 0.0
+    return sum(vals)/len(vals) if vals else 0.0
 
 def calc_rsi(candles, n=14):
-    if len(candles) < n + 1:
-        return 50.0
+    if len(candles)<n+1: return 50.0
     closes = [c["c"] for c in candles]
-    gains  = [max(closes[i] - closes[i-1], 0) for i in range(1, len(closes))]
-    losses = [max(closes[i-1] - closes[i], 0) for i in range(1, len(closes))]
-    ag = sum(gains[-n:]) / n
-    al = sum(losses[-n:]) / n
-    if al == 0:
-        return 100.0
-    return round(100.0 - 100.0 / (1.0 + ag / al), 1)
+    gains  = [max(closes[i]-closes[i-1],0) for i in range(1,len(closes))]
+    losses = [max(closes[i-1]-closes[i],0) for i in range(1,len(closes))]
+    ag = sum(gains[-n:])/n
+    al = sum(losses[-n:])/n
+    if al==0: return 100.0
+    return round(100.0-100.0/(1.0+ag/al),1)
 
 def calc_ema(closes, n):
-    if not closes:
-        return 0.0
-    if len(closes) < n:
-        return closes[-1]
-    k = 2.0 / (n + 1)
-    e = sum(closes[:n]) / n
-    for v in closes[n:]:
-        e = v * k + e * (1 - k)
+    if not closes: return 0.0
+    if len(closes)<n: return closes[-1]
+    k = 2.0/(n+1)
+    e = sum(closes[:n])/n
+    for v in closes[n:]: e = v*k+e*(1-k)
     return e
 
 def calc_bb(closes, n=20):
-    if len(closes) < n:
-        mid = closes[-1] if closes else 0
-        return mid, mid, mid
+    if len(closes)<n: mid=closes[-1] if closes else 0; return mid,mid,mid
     recent = closes[-n:]
-    mid = sum(recent) / n
-    std = (sum((x - mid) ** 2 for x in recent) / n) ** 0.5
-    return round(mid + 2*std, 8), round(mid, 8), round(mid - 2*std, 8)
+    mid = sum(recent)/n
+    std = (sum((x-mid)**2 for x in recent)/n)**0.5
+    return round(mid+2*std,8), round(mid,8), round(mid-2*std,8)
 
 def calc_stoch_rsi(candles, rsi_n=14, stoch_n=14):
-    if len(candles) < rsi_n + stoch_n + 1:
-        return 50.0
+    if len(candles)<rsi_n+stoch_n+1: return 50.0
     closes = [c["c"] for c in candles]
     rsi_series = []
     for i in range(rsi_n, len(closes)):
-        sub = [{"c": closes[j]} for j in range(i - rsi_n, i + 1)]
+        sub = [{"c":closes[j]} for j in range(i-rsi_n,i+1)]
         rsi_series.append(calc_rsi(sub, rsi_n))
-    if len(rsi_series) < stoch_n:
-        return 50.0
+    if len(rsi_series)<stoch_n: return 50.0
     recent = rsi_series[-stoch_n:]
-    lo, hi = min(recent), max(recent)
-    if hi == lo:
-        return 50.0
-    return round((rsi_series[-1] - lo) / (hi - lo) * 100, 1)
+    lo,hi = min(recent),max(recent)
+    if hi==lo: return 50.0
+    return round((rsi_series[-1]-lo)/(hi-lo)*100,1)
 
 def detect_divergence(candles, lookback=20):
-    if len(candles) < lookback * 2:
-        return None
+    if len(candles)<lookback*2: return None
     half = lookback
-    recent = candles[-half:]
-    prev   = candles[-half*2:-half]
-    rsi_r  = calc_rsi(candles[-half-14:]) if len(candles) >= half+14 else 50
-    rsi_p  = calc_rsi(candles[-half*2-14:-half]) if len(candles) >= half*2+14 else 50
-    price_r = recent[-1]["c"]
-    price_p = prev[-1]["c"]
+    rsi_r = calc_rsi(candles[-half-14:]) if len(candles)>=half+14 else 50
+    rsi_p = calc_rsi(candles[-half*2-14:-half]) if len(candles)>=half*2+14 else 50
+    price_r = candles[-1]["c"]
+    price_p = candles[-half]["c"]
     price_up = price_r > price_p
     rsi_up   = rsi_r > rsi_p
-    if price_up and not rsi_up and rsi_r > 60:
-        return "BEARISH"
-    if not price_up and rsi_up and rsi_r < 40:
-        return "BULLISH"
+    if price_up and not rsi_up and rsi_r>60: return "BEARISH"
+    if not price_up and rsi_up and rsi_r<40: return "BULLISH"
     return None
 
+def calc_vwap(candles):
+    if not candles: return 0.0
+    tv,tp = 0.0,0.0
+    for c in candles:
+        typ = (c["h"]+c["l"]+c["c"])/3
+        tp += typ*c["v"]; tv += c["v"]
+    return round(tp/tv,8) if tv>0 else 0.0
+
+def calc_momentum(candles, n=10):
+    if len(candles)<n+1: return 0.0
+    closes = [c["c"] for c in candles]
+    return round((closes[-1]-closes[-n-1])/closes[-n-1]*100,3)
+
+def calc_vol_spike(candles, n=20):
+    if len(candles)<n+1: return 1.0
+    avg = sum(c["v"] for c in candles[-n-1:-1])/n
+    return round(candles[-1]["v"]/avg,2) if avg>0 else 1.0
+
+def find_liquidity(candles, n=20):
+    if len(candles)<n: return 0.0,0.0
+    recent = candles[-n:]
+    highs,lows = [],[]
+    for i in range(1,len(recent)-1):
+        if recent[i]["h"]>recent[i-1]["h"] and recent[i]["h"]>recent[i+1]["h"]:
+            highs.append(recent[i]["h"])
+        if recent[i]["l"]<recent[i-1]["l"] and recent[i]["l"]<recent[i+1]["l"]:
+            lows.append(recent[i]["l"])
+    return (max(highs) if highs else 0.0),(min(lows) if lows else 0.0)
+
 # ═══════════════════════════════════════════════════════════
-# 三燈系統（仿原版 1H/4H/1D）
+# 三燈系統（波段專用）
 # ═══════════════════════════════════════════════════════════
 def get_tf_signal(sym, bar):
-    """
-    單一時間框架信號
-    BULLISH / BEARISH / NEUTRAL / REVERSAL_UP / REVERSAL_DOWN
-    """
     candles = get_klines(sym, bar, 150)
-    if not candles or len(candles) < 50:
-        return "NEUTRAL"
-
+    if not candles or len(candles)<50: return "NEUTRAL"
     closes = [c["c"] for c in candles]
     price  = closes[-1]
     rsi    = calc_rsi(candles)
-    ema20  = calc_ema(closes, 20)
-    ema50  = calc_ema(closes, 50)
-    ema200 = calc_ema(closes, 200) if len(closes) >= 200 else ema50
+    ema20  = calc_ema(closes,20)
+    ema50  = calc_ema(closes,50)
     div    = detect_divergence(candles)
-
-    if div == "BULLISH":
-        return "REVERSAL_UP"
-    if div == "BEARISH":
-        return "REVERSAL_DOWN"
-
-    # 強多頭：價格在所有均線之上，RSI > 55
-    if price > ema20 > ema50 and rsi > 55:
-        return "BULLISH"
-    # 強空頭：價格在所有均線之下，RSI < 45
-    if price < ema20 < ema50 and rsi < 45:
-        return "BEARISH"
-
+    if div=="BULLISH": return "REVERSAL_UP"
+    if div=="BEARISH": return "REVERSAL_DOWN"
+    if price>ema20>ema50 and rsi>55: return "BULLISH"
+    if price<ema20<ema50 and rsi<45: return "BEARISH"
     return "NEUTRAL"
 
 def get_three_lights(sym):
-    """取得 1H/4H/1D 三燈"""
     lights = {}
-    for tf, bar in [("1H","1H"), ("4H","4H"), ("1D","1D")]:
-        lights[tf] = get_tf_signal(sym, bar)
-        time.sleep(0.15)
+    for tf,bar in [("1H","1H"),("4H","4H"),("1D","1D")]:
+        lights[tf] = get_tf_signal(sym,bar)
+        time.sleep(0.12)
     return lights
 
 def analyze_lights(lights):
-    """
-    分析三燈方向和強度
-    回傳 (direction, strength, is_reversal)
-    strength: 0~3（幾個燈號同向）
-    """
     bull = sum(1 for v in lights.values() if v in ["BULLISH","REVERSAL_UP"])
     bear = sum(1 for v in lights.values() if v in ["BEARISH","REVERSAL_DOWN"])
     rev  = any(v in ["REVERSAL_UP","REVERSAL_DOWN"] for v in lights.values())
-
-    if bull >= 2:
-        return "BULLISH", bull, rev
-    if bear >= 2:
-        return "BEARISH", bear, rev
+    if bull>=2: return "BULLISH", bull, rev
+    if bear>=2: return "BEARISH", bear, rev
     return "NEUTRAL", 0, rev
 
 # ═══════════════════════════════════════════════════════════
-# 幣種歷史勝率
+# 高週期偏向（日內專用）
 # ═══════════════════════════════════════════════════════════
-def get_symbol_winrate(all_signals, symbol, direction):
-    related = [s for s in all_signals
-               if s.get("symbol") == symbol
-               and s.get("direction") == direction
+def get_htf_bias(sym):
+    scores = {"LONG":0,"SHORT":0}
+    for bar in ["15m","1H"]:
+        candles = get_klines(sym,bar,50)
+        if not candles or len(candles)<20: continue
+        closes = [c["c"] for c in candles]
+        rsi   = calc_rsi(candles)
+        ema9  = calc_ema(closes,9)
+        ema21 = calc_ema(closes,21)
+        price = closes[-1]
+        if price>ema9>ema21 and rsi>52: scores["LONG"]+=2
+        elif price<ema9<ema21 and rsi<48: scores["SHORT"]+=2
+        elif rsi>55: scores["LONG"]+=1
+        elif rsi<45: scores["SHORT"]+=1
+        time.sleep(0.1)
+    if scores["LONG"]>scores["SHORT"]: return "LONG"
+    if scores["SHORT"]>scores["LONG"]: return "SHORT"
+    return "NEUTRAL"
+
+def get_symbol_winrate(signals, symbol, direction):
+    related = [s for s in signals
+               if s.get("symbol")==symbol
+               and s.get("direction")==direction
                and s.get("result") in ["WIN","LOSS"]]
-    if not related:
-        return 0.0, 0
-    wins = sum(1 for s in related if s.get("result") == "WIN")
-    return round(wins / len(related) * 100, 1), len(related)
+    if not related: return 0.0,0
+    wins = sum(1 for s in related if s.get("result")=="WIN")
+    return round(wins/len(related)*100,1), len(related)
 
 # ═══════════════════════════════════════════════════════════
-# 核心訊號分析
+# 波段訊號分析
 # ═══════════════════════════════════════════════════════════
-ROLES = {
-    "LONG":  ["獵頭者"],
-    "SHORT": ["沉思者"],
-}
+SWING_ROLES = {"LONG":["獵頭者"],"SHORT":["沉思者"]}
 
-def analyze(name, sym, tf_label, tf_bar, all_signals):
-    print("  " + name + " " + tf_label, end=" ... ")
-
-    # ── 抓數據 ──
-    price   = get_price(sym)
-    if price == 0:
-        print("skip(no price)")
-        return None
+def analyze_swing(name, sym, tf_label, tf_bar, all_signals):
+    print("  [波段]" + name + " " + tf_label, end=" ")
+    price = get_price(sym)
+    if price==0: print("skip"); return None
 
     funding = get_funding(sym)
     lsr     = get_lsr(sym)
     oi      = get_oi(sym)
     candles = get_klines(sym, tf_bar, 150)
-
-    if not candles or len(candles) < 30:
-        print("skip(no candles)")
-        return None
+    if not candles or len(candles)<30: print("skip"); return None
 
     closes    = [c["c"] for c in candles]
     atr_val   = calc_atr(candles)
     rsi_val   = calc_rsi(candles)
     stoch_rsi = calc_stoch_rsi(candles)
-    ema20     = calc_ema(closes, 20)
-    ema50     = calc_ema(closes, 50) if len(closes) >= 50 else ema20
-    ema200    = calc_ema(closes, 200) if len(closes) >= 200 else ema50
-    bb_u, bb_m, bb_l = calc_bb(closes)
+    ema20     = calc_ema(closes,20)
+    ema50     = calc_ema(closes,50) if len(closes)>=50 else ema20
+    ema200    = calc_ema(closes,200) if len(closes)>=200 else ema50
+    bb_u,bb_m,bb_l = calc_bb(closes)
     div       = detect_divergence(candles)
-    vol_avg   = sum(c["v"] for c in candles[-21:-1]) / 20 if len(candles) > 20 else 1
-    vol_ratio = round(candles[-1]["v"] / vol_avg, 2) if vol_avg > 0 else 1.0
+    vol_avg   = sum(c["v"] for c in candles[-21:-1])/20 if len(candles)>20 else 1
+    vol_ratio = round(candles[-1]["v"]/vol_avg,2) if vol_avg>0 else 1.0
     session, session_liq = get_session()
 
-    # ── 三燈系統 ──
     lights = get_three_lights(sym)
-    market_dir, light_strength, has_reversal = analyze_lights(lights)
+    market_dir, light_strength, has_rev = analyze_lights(lights)
 
-    # ── 計分系統 ──
-    ls = 0  # long score
-    ss = 0  # short score
-    reasons_l = []
-    reasons_s = []
+    ls=0; ss=0; rl=[]; rs=[]
 
-    # 層1：三燈（最重要，仿原版核心）權重最高
-    if market_dir == "BULLISH":
-        ls += light_strength * 2
-        reasons_l.append("三燈看漲 " + str(light_strength) + "/3")
-    elif market_dir == "BEARISH":
-        ss += light_strength * 2
-        reasons_s.append("三燈看跌 " + str(light_strength) + "/3")
-    # 反轉信號額外加分
-    if has_reversal:
-        if market_dir == "BULLISH":
-            ls += 1; reasons_l.append("含反轉結構")
-        elif market_dir == "BEARISH":
-            ss += 1; reasons_s.append("含反轉結構")
+    # 三燈（最重要）
+    if market_dir=="BULLISH":
+        ls+=light_strength*2; rl.append("三燈看漲"+str(light_strength)+"/3")
+    elif market_dir=="BEARISH":
+        ss+=light_strength*2; rs.append("三燈看跌"+str(light_strength)+"/3")
+    if has_rev:
+        if market_dir=="BULLISH": ls+=1; rl.append("含反轉結構")
+        elif market_dir=="BEARISH": ss+=1; rs.append("含反轉結構")
 
-    # 層2：資金費率 權重2
-    if funding <= -0.03:
-        ls += 2; reasons_l.append("資金費率極低" + str(funding) + "%")
-    elif funding <= -0.01:
-        ls += 1; reasons_l.append("資金費率負值")
-    if funding >= 0.06:
-        ss += 2; reasons_s.append("資金費率極高" + str(funding) + "%")
-    elif funding >= 0.02:
-        ss += 1; reasons_s.append("資金費率偏高")
+    # 資金費率
+    if funding<=-0.03: ls+=2; rl.append("資金費率極低"+str(funding)+"%")
+    elif funding<=-0.01: ls+=1
+    if funding>=0.06: ss+=2; rs.append("資金費率極高"+str(funding)+"%")
+    elif funding>=0.02: ss+=1
 
-    # 層3：多空比（逆向散戶）權重2
-    if lsr <= 0.75:
-        ls += 2; reasons_l.append("散戶極度做空 LSR:" + str(lsr))
-    elif lsr <= 0.90:
-        ls += 1; reasons_l.append("多空比偏空")
-    if lsr >= 1.4:
-        ss += 2; reasons_s.append("散戶極度做多 LSR:" + str(lsr))
-    elif lsr >= 1.15:
-        ss += 1; reasons_s.append("多空比偏多")
+    # 多空比
+    if lsr<=0.75: ls+=2; rl.append("散戶極度做空 LSR:"+str(lsr))
+    elif lsr<=0.90: ls+=1
+    if lsr>=1.4: ss+=2; rs.append("散戶極度做多 LSR:"+str(lsr))
+    elif lsr>=1.15: ss+=1
 
-    # 層4：RSI 權重2
-    if rsi_val <= 25:
-        ls += 2; reasons_l.append("RSI嚴重超賣:" + str(rsi_val))
-    elif rsi_val <= 38:
-        ls += 1; reasons_l.append("RSI超賣:" + str(rsi_val))
-    if rsi_val >= 75:
-        ss += 2; reasons_s.append("RSI嚴重超買:" + str(rsi_val))
-    elif rsi_val >= 62:
-        ss += 1; reasons_s.append("RSI超買:" + str(rsi_val))
+    # RSI
+    if rsi_val<=25: ls+=2; rl.append("RSI嚴重超賣:"+str(rsi_val))
+    elif rsi_val<=38: ls+=1; rl.append("RSI超賣:"+str(rsi_val))
+    if rsi_val>=75: ss+=2; rs.append("RSI嚴重超買:"+str(rsi_val))
+    elif rsi_val>=62: ss+=1; rs.append("RSI超買:"+str(rsi_val))
 
-    # 層5：StochRSI 權重1
-    if stoch_rsi <= 15:
-        ls += 1; reasons_l.append("StochRSI極度超賣:" + str(stoch_rsi))
-    elif stoch_rsi <= 25:
-        ls += 1
-    if stoch_rsi >= 85:
-        ss += 1; reasons_s.append("StochRSI極度超買:" + str(stoch_rsi))
-    elif stoch_rsi >= 75:
-        ss += 1
+    # StochRSI
+    if stoch_rsi<=15: ls+=1; rl.append("StochRSI超賣")
+    if stoch_rsi>=85: ss+=1; rs.append("StochRSI超買")
 
-    # 層6：均線排列 權重2
-    if price > ema20 > ema50:
-        ls += 2; reasons_l.append("均線多頭排列")
-    elif price < ema20 < ema50:
-        ss += 2; reasons_s.append("均線空頭排列")
+    # 均線
+    if price>ema20>ema50: ls+=2; rl.append("均線多頭排列")
+    elif price<ema20<ema50: ss+=2; rs.append("均線空頭排列")
 
-    # 層7：EMA200 大趨勢 權重1
-    if price > ema200:
-        ls += 1
-    else:
-        ss += 1
+    # EMA200
+    if price>ema200: ls+=1
+    else: ss+=1
 
-    # 層8：布林帶 權重1
-    if price <= bb_l:
-        ls += 1; reasons_l.append("觸碰布林下軌")
-    if price >= bb_u:
-        ss += 1; reasons_s.append("觸碰布林上軌")
+    # 布林帶
+    if price<=bb_l: ls+=1; rl.append("觸碰布林下軌")
+    if price>=bb_u: ss+=1; rs.append("觸碰布林上軌")
 
-    # 層9：RSI背離（反轉）權重2
-    if div == "BULLISH":
-        ls += 2; reasons_l.append("RSI看漲背離")
-    elif div == "BEARISH":
-        ss += 2; reasons_s.append("RSI看跌背離")
+    # 背離
+    if div=="BULLISH": ls+=2; rl.append("RSI看漲背離")
+    elif div=="BEARISH": ss+=2; rs.append("RSI看跌背離")
 
-    # 層10：成交量確認 權重1
-    if vol_ratio >= 2.0:
-        if price > closes[-2]:
-            ls += 1; reasons_l.append("成交量暴增看漲 " + str(vol_ratio) + "x")
-        else:
-            ss += 1; reasons_s.append("成交量暴增看跌 " + str(vol_ratio) + "x")
+    # 成交量
+    if vol_ratio>=2.0:
+        if price>closes[-2]: ls+=1; rl.append("成交量暴增看漲")
+        else: ss+=1; rs.append("成交量暴增看跌")
 
-    # 層11：流動性時段 權重1
-    if session_liq == "high":
-        if ls > ss:
-            ls += 1
-        elif ss > ls:
-            ss += 1
+    # 流動性時段
+    if session_liq=="high":
+        if ls>ss: ls+=1
+        elif ss>ls: ss+=1
 
-    print("L:" + str(ls) + " S:" + str(ss) + " " + market_dir, end=" ")
+    print("L:"+str(ls)+" S:"+str(ss)+" "+market_dir, end=" ")
 
-    # ── 門檻過濾 ──
-    if ls < MIN_SCORE and ss < MIN_SCORE:
-        print("-> 條件不足(" + str(max(ls,ss)) + "<" + str(MIN_SCORE) + ")")
-        return None
+    if ls<SWING_MIN_SCORE and ss<SWING_MIN_SCORE:
+        print("條件不足"); return None
 
-    direction = "LONG" if ls >= ss else "SHORT"
-    score     = ls if direction == "LONG" else ss
-    reasons   = reasons_l if direction == "LONG" else reasons_s
+    direction = "LONG" if ls>=ss else "SHORT"
+    score     = ls if direction=="LONG" else ss
+    reasons   = rl if direction=="LONG" else rs
 
-    # ── 順勢/反轉判斷 ──
-    is_counter = False
-    if direction == "LONG" and market_dir == "BEARISH":
-        is_counter = True
-    elif direction == "SHORT" and market_dir == "BULLISH":
-        is_counter = True
-    if div is not None:
-        is_counter = True
+    is_counter = (
+        (direction=="LONG" and market_dir=="BEARISH") or
+        (direction=="SHORT" and market_dir=="BULLISH") or
+        (div is not None)
+    )
     signal_type = "反轉" if is_counter else "順勢"
 
-    # ── SL 計算（確保足夠空間）──
-    atr_mult = 2.0 if is_counter else 2.5
-    sl_dist  = atr_val * atr_mult if atr_val > 0 else 0
+    min_sl  = price * SWING_MIN_SL
+    sl_dist = max(atr_val*(2.0 if is_counter else 2.5), min_sl)
+    trigger = price
+    sl      = round(trigger-sl_dist if direction=="LONG" else trigger+sl_dist, 8)
+    risk_pct= round(abs(sl-trigger)/trigger*100,2)
 
-    # 最小SL保護：至少 MIN_SL_PCT
-    min_sl = price * MIN_SL_PCT
-    if sl_dist < min_sl:
-        sl_dist = min_sl
+    if risk_pct < SWING_MIN_RISK:
+        print("R值不足"); return None
 
-    trigger  = price
-    sl       = round(trigger - sl_dist if direction == "LONG" else trigger + sl_dist, 8)
-    risk_pct = round(abs(sl - trigger) / trigger * 100, 2)
+    ratios  = [1.0,1.5,2.5,4.0] if is_counter else [1.0,2.0,3.0,5.0]
+    tps     = [round(trigger+sl_dist*r if direction=="LONG" else trigger-sl_dist*r,8) for r in ratios]
+    sym_wr, sym_cnt = get_symbol_winrate(all_signals, name, direction)
+    role    = SWING_ROLES[direction][0]
 
-    # ── R值過濾 ──
-    if risk_pct < MIN_RISK_PCT:
-        print("-> R值不足(" + str(risk_pct) + "%)")
-        return None
-
-    # ── TP 計算 ──
-    # 順勢：1R/2R/3R/5R
-    # 反轉：1R/1.5R/2.5R/4R（目標保守）
-    ratios = [1.0, 1.5, 2.5, 4.0] if is_counter else [1.0, 2.0, 3.0, 5.0]
-    tps = []
-    for r in ratios:
-        if direction == "LONG":
-            tps.append(round(trigger + sl_dist * r, 8))
-        else:
-            tps.append(round(trigger - sl_dist * r, 8))
-
-    # ── 歷史勝率 ──
-    sym_wr, sym_count = get_symbol_winrate(all_signals, name, direction)
-
-    role = random.choice(ROLES[direction])
-    print("-> " + direction + "[" + signal_type + "] R:" + str(risk_pct) + "% score:" + str(score))
-
+    print("-> "+direction+"["+signal_type+"] R:"+str(risk_pct)+"% score:"+str(score))
     return {
-        "id":             name + "-" + tf_label + "-" + str(int(time.time())),
-        "symbol":         name,
-        "timeframe":      tf_label,
-        "direction":      direction,
-        "role":           role,
-        "signal_type":    signal_type,
-        "session":        session,
-        "trigger":        round(trigger, 8),
-        "current":        round(trigger, 8),
-        "sl":             sl,
-        "risk_pct":       risk_pct,
-        "tp1":            tps[0],
-        "tp2":            tps[1],
-        "tp3":            tps[2],
-        "ftp":            tps[3],
-        "pnl":            0.0,
-        "reached_tp":     0,
-        "active":         True,
-        "funding":        funding,
-        "lsr":            lsr,
-        "oi":             oi,
-        "rsi":            rsi_val,
-        "stoch_rsi":      stoch_rsi,
-        "market_bias":    market_dir,
-        "lights":         lights,
-        "light_strength": light_strength,
-        "vol_ratio":      vol_ratio,
-        "divergence":     div,
-        "score":          score,
-        "long_score":     ls,
-        "short_score":    ss,
-        "reasons":        reasons,
-        "sym_win_rate":   sym_wr,
-        "sym_count":      sym_count,
-        "chg24h":         0.0,
-        "triggered_at":   tw_now(),
-        "timestamp":      int(time.time()),
-        "ftp_reached_at": None,
-        "result":         None,
+        "id":name+"-"+tf_label+"-"+str(int(time.time())),
+        "symbol":name,"timeframe":tf_label,"direction":direction,"role":role,
+        "signal_type":signal_type,"session":session,
+        "trigger":round(trigger,8),"current":round(trigger,8),"sl":sl,
+        "risk_pct":risk_pct,"tp1":tps[0],"tp2":tps[1],"tp3":tps[2],"ftp":tps[3],
+        "pnl":0.0,"reached_tp":0,"active":True,
+        "funding":funding,"lsr":lsr,"oi":oi,"rsi":rsi_val,
+        "stoch_rsi":stoch_rsi,"market_bias":market_dir,"lights":lights,
+        "vol_ratio":vol_ratio,"divergence":div,"score":score,
+        "long_score":ls,"short_score":ss,"reasons":reasons,
+        "sym_win_rate":sym_wr,"sym_count":sym_cnt,"chg24h":0.0,
+        "triggered_at":tw_now(),"timestamp":int(time.time()),
+        "ftp_reached_at":None,"result":None,
     }
 
 # ═══════════════════════════════════════════════════════════
-# 盈虧更新
+# 日內訊號分析
 # ═══════════════════════════════════════════════════════════
-SYM_MAP = {
-    "BTC":"BTC-USDT-SWAP","ETH":"ETH-USDT-SWAP","SOL":"SOL-USDT-SWAP",
-    "DOGE":"DOGE-USDT-SWAP","BNB":"BNB-USDT-SWAP","XRP":"XRP-USDT-SWAP",
-    "ADA":"ADA-USDT-SWAP","AVAX":"AVAX-USDT-SWAP","LINK":"LINK-USDT-SWAP",
-    "ARB":"ARB-USDT-SWAP","OP":"OP-USDT-SWAP","TRX":"TRX-USDT-SWAP",
-    "NEAR":"NEAR-USDT-SWAP","APT":"APT-USDT-SWAP","SUI":"SUI-USDT-SWAP",
-    "INJ":"INJ-USDT-SWAP","FIL":"FIL-USDT-SWAP","ATOM":"ATOM-USDT-SWAP",
-}
+def analyze_intraday(name, sym, mode_name, entry_bar, ref_bar, min_r, sl_pct):
+    price = get_price(sym)
+    if price==0: return None
+
+    funding = get_funding(sym)
+    lsr     = get_lsr(sym)
+    candles = get_klines(sym, entry_bar, 100)
+    if not candles or len(candles)<20: return None
+
+    closes    = [c["c"] for c in candles]
+    atr_val   = calc_atr(candles)
+    rsi_val   = calc_rsi(candles)
+    ema9      = calc_ema(closes,9)
+    ema21     = calc_ema(closes,21)
+    vwap      = calc_vwap(candles)
+    momentum  = calc_momentum(candles)
+    vol_spike = calc_vol_spike(candles)
+    liq_high, liq_low = find_liquidity(candles)
+    or_high   = max(c["h"] for c in candles[:6]) if len(candles)>=6 else 0.0
+    or_low    = min(c["l"] for c in candles[:6]) if len(candles)>=6 else 0.0
+    htf_bias  = get_htf_bias(sym)
+    session, session_liq = get_session()
+
+    ls=0; ss=0; rl=[]; rs=[]
+
+    # VWAP（日內核心）
+    vwap_dist = round((price-vwap)/vwap*100,2) if vwap>0 else 0
+    if price>vwap: ls+=2; rl.append("價格在VWAP上方+"+str(abs(vwap_dist))+"%")
+    else: ss+=2; rs.append("價格在VWAP下方-"+str(abs(vwap_dist))+"%")
+
+    # 高週期方向
+    if htf_bias=="LONG": ls+=3; rl.append("高週期多頭")
+    elif htf_bias=="SHORT": ss+=3; rs.append("高週期空頭")
+
+    # EMA排列
+    if price>ema9>ema21: ls+=2; rl.append("EMA多頭排列")
+    elif price<ema9<ema21: ss+=2; rs.append("EMA空頭排列")
+
+    # RSI
+    if rsi_val<=30: ls+=2; rl.append("RSI超賣:"+str(rsi_val))
+    elif rsi_val<=42: ls+=1
+    if rsi_val>=70: ss+=2; rs.append("RSI超買:"+str(rsi_val))
+    elif rsi_val>=58: ss+=1
+
+    # 開盤區間突破
+    if or_high>0 and price>or_high: ls+=2; rl.append("突破開盤高點")
+    if or_low>0 and price<or_low:   ss+=2; rs.append("跌破開盤低點")
+
+    # 流動性掃蕩
+    if liq_low>0 and price<=liq_low*1.002: ls+=2; rl.append("流動性低點掃蕩")
+    if liq_high>0 and price>=liq_high*0.998: ss+=2; rs.append("流動性高點掃蕩")
+
+    # 動能
+    if momentum>=0.5: ls+=1; rl.append("正動能+"+str(momentum)+"%")
+    elif momentum<=-0.5: ss+=1; rs.append("負動能"+str(momentum)+"%")
+
+    # 成交量爆量
+    if vol_spike>=2.0:
+        if price>closes[-2]: ls+=1; rl.append("成交量爆量"+str(vol_spike)+"x")
+        else: ss+=1; rs.append("成交量爆量"+str(vol_spike)+"x")
+
+    # 資金費率
+    if funding<=-0.02: ls+=1; rl.append("資金費率負值")
+    if funding>=0.05:  ss+=1; rs.append("資金費率極高")
+
+    # 多空比
+    if lsr<=0.8:  ls+=1; rl.append("散戶過度做空")
+    if lsr>=1.4:  ss+=1; rs.append("散戶過度做多")
+
+    # 時段加成
+    if session_liq=="high":
+        if ls>ss: ls+=1
+        elif ss>ls: ss+=1
+
+    if ls<INTRADAY_MIN_SCORE and ss<INTRADAY_MIN_SCORE:
+        return None
+
+    direction = "LONG" if ls>=ss else "SHORT"
+    score     = ls if direction=="LONG" else ss
+    reasons   = rl if direction=="LONG" else rs
+
+    min_sl  = price*(sl_pct/100)
+    sl_dist = max(atr_val*1.5, min_sl)
+    trigger = price
+    sl      = round(trigger-sl_dist if direction=="LONG" else trigger+sl_dist,8)
+    risk_pct= round(abs(sl-trigger)/trigger*100,2)
+
+    if risk_pct < min_r: return None
+
+    tps = [round(trigger+sl_dist*r if direction=="LONG" else trigger-sl_dist*r,8)
+           for r in [0.8,1.5,2.5,4.0]]
+    role = "獵頭者" if direction=="LONG" else "沉思者"
+
+    return {
+        "id":name+"-"+mode_name+"-"+str(int(time.time())),
+        "symbol":name,"timeframe":mode_name,"mode":mode_name,
+        "entry_tf":entry_bar,"direction":direction,"role":role,
+        "signal_type":"日內","session":session,
+        "trigger":round(trigger,8),"current":round(trigger,8),"sl":sl,
+        "risk_pct":risk_pct,"tp1":tps[0],"tp2":tps[1],"tp3":tps[2],"ftp":tps[3],
+        "vwap":round(vwap,8),"or_high":round(or_high,8),"or_low":round(or_low,8),
+        "liq_high":round(liq_high,8),"liq_low":round(liq_low,8),
+        "momentum":momentum,"vol_spike":vol_spike,"htf_bias":htf_bias,
+        "rsi":rsi_val,"funding":funding,"lsr":lsr,
+        "score":score,"long_score":ls,"short_score":ss,"reasons":reasons,
+        "pnl":0.0,"reached_tp":0,"active":True,"chg24h":0.0,
+        "triggered_at":tw_now(),"timestamp":int(time.time()),
+        "ftp_reached_at":None,"result":None,
+    }
+
+# ═══════════════════════════════════════════════════════════
+# 盈虧更新（共用）
+# ═══════════════════════════════════════════════════════════
+SYM_MAP = {n:s for n,s in SYMBOLS}
 
 def update_pnl(sig):
-    p = get_price(SYM_MAP.get(sig["symbol"], sig["symbol"] + "-USDT-SWAP"))
-    if not p:
-        return sig
+    p = get_price(SYM_MAP.get(sig["symbol"], sig["symbol"]+"-USDT-SWAP"))
+    if not p: return sig
     sig["current"] = p
-    t   = sig["trigger"]
+    t = sig["trigger"]
     pnl = (p-t)/t*100 if sig["direction"]=="LONG" else (t-p)/t*100
-    sig["pnl"] = round(pnl, 2)
-
-    prev_tp = sig.get("reached_tp", 0)
-    for i, tp in enumerate([sig["tp1"],sig["tp2"],sig["tp3"],sig["ftp"]]):
-        if sig["direction"]=="LONG" and p >= tp:
-            sig["reached_tp"] = i + 1
-        elif sig["direction"]=="SHORT" and p <= tp:
-            sig["reached_tp"] = i + 1
-
-    if sig.get("reached_tp",0) == 4 and prev_tp < 4:
+    sig["pnl"] = round(pnl,2)
+    prev = sig.get("reached_tp",0)
+    for i,tp in enumerate([sig["tp1"],sig["tp2"],sig["tp3"],sig["ftp"]]):
+        if sig["direction"]=="LONG" and p>=tp: sig["reached_tp"]=i+1
+        elif sig["direction"]=="SHORT" and p<=tp: sig["reached_tp"]=i+1
+    if sig.get("reached_tp",0)==4 and prev<4:
         sig["ftp_reached_at"] = tw_now()
         sig["result"] = "WIN"
-        print("  🏆 FTP！" + sig["symbol"] + " " + sig["direction"] +
-              " pnl:" + str(sig["pnl"]) + "%")
-
-    if sig["direction"]=="LONG" and p <= sig["sl"]:
-        sig["active"] = False
-        if not sig.get("result"):
-            sig["result"] = "LOSS"
-            print("  ❌ 止損 " + sig["symbol"] + " pnl:" + str(sig["pnl"]) + "%")
-    elif sig["direction"]=="SHORT" and p >= sig["sl"]:
-        sig["active"] = False
-        if not sig.get("result"):
-            sig["result"] = "LOSS"
-            print("  ❌ 止損 " + sig["symbol"] + " pnl:" + str(sig["pnl"]) + "%")
+        label = "[日內]" if sig.get("signal_type")=="日內" else "[波段]"
+        print("  🏆 FTP！" + label + sig["symbol"])
+    if sig["direction"]=="LONG" and p<=sig["sl"]:
+        sig["active"]=False
+        if not sig.get("result"): sig["result"]="LOSS"
+    elif sig["direction"]=="SHORT" and p>=sig["sl"]:
+        sig["active"]=False
+        if not sig.get("result"): sig["result"]="LOSS"
     return sig
 
 # ═══════════════════════════════════════════════════════════
-# GitHub 持久化儲存
+# GitHub 持久化
 # ═══════════════════════════════════════════════════════════
-def github_load():
-    if not GITHUB_TOKEN or not GITHUB_REPO:
-        print("  未設定GitHub，跳過載入")
-        return []
+def gh_load(filename):
+    if not GITHUB_TOKEN or not GITHUB_REPO: return []
     try:
         import base64
-        url = "https://api.github.com/repos/" + GITHUB_REPO + "/contents/data/signals.json"
+        url = "https://api.github.com/repos/"+GITHUB_REPO+"/contents/data/"+filename
         req = urllib.request.Request(url, headers={
-            "Authorization": "token " + GITHUB_TOKEN,
-            "User-Agent": "sentiment-lens",
-        })
+            "Authorization":"token "+GITHUB_TOKEN,"User-Agent":"sentiment-lens"})
         with urllib.request.urlopen(req, timeout=10) as r:
             meta = json.loads(r.read())
-        content = base64.b64decode(meta["content"]).decode("utf-8")
-        sigs = json.loads(content).get("signals", [])
-        print("  GitHub載入 " + str(len(sigs)) + " 筆訊號")
+        sigs = json.loads(base64.b64decode(meta["content"]).decode("utf-8")).get("signals",[])
+        print("  GitHub載入["+filename+"] "+str(len(sigs))+"筆")
         return sigs
     except Exception as e:
-        print("  GitHub載入失敗: " + str(e)[:60])
+        print("  GitHub載入失敗["+filename+"]: "+str(e)[:50])
         return []
 
-def github_save(signals):
-    if not GITHUB_TOKEN or not GITHUB_REPO:
-        return
+def gh_save(signals, filename, extra={}):
+    if not GITHUB_TOKEN or not GITHUB_REPO: return
     try:
         import base64
-        wins    = [s for s in signals if s.get("result") == "WIN"]
-        losses  = [s for s in signals if s.get("result") == "LOSS"]
-        closed  = len(wins) + len(losses)
-        wr      = round(len(wins)/closed*100, 1) if closed > 0 else 0.0
-
-        # 各幣種統計
-        sym_stats = {}
-        for s in signals:
-            if s.get("result") not in ["WIN","LOSS"]:
-                continue
-            key = s["symbol"] + "_" + s["direction"]
-            if key not in sym_stats:
-                sym_stats[key] = {"wins":0,"losses":0,"pnl":0.0}
-            if s["result"] == "WIN":
-                sym_stats[key]["wins"] += 1
-            else:
-                sym_stats[key]["losses"] += 1
-            sym_stats[key]["pnl"] = round(sym_stats[key]["pnl"] + s.get("pnl",0), 2)
-
-        data = {
-            "signals":      signals,
-            "updated_at":   tw_now_full() + " (台北時間)",
-            "total":        len(signals),
-            "active":       sum(1 for s in signals if s.get("active",True) and not s.get("result")),
-            "ftp_count":    sum(1 for s in signals if s.get("reached_tp",0)==4),
-            "win_count":    len(wins),
-            "loss_count":   len(losses),
-            "win_rate":     wr,
-            "trend_wins":   sum(1 for s in wins if s.get("signal_type")=="順勢"),
-            "counter_wins": sum(1 for s in wins if s.get("signal_type")=="反轉"),
-            "sym_stats":    sym_stats,
+        wins   = [s for s in signals if s.get("result")=="WIN"]
+        losses = [s for s in signals if s.get("result")=="LOSS"]
+        closed = len(wins)+len(losses)
+        wr     = round(len(wins)/closed*100,1) if closed>0 else 0.0
+        data   = {
+            "signals":signals,
+            "updated_at":tw_now_full()+" (台北時間)",
+            "total":len(signals),
+            "active":sum(1 for s in signals if s.get("active",True) and not s.get("result")),
+            "ftp_count":sum(1 for s in signals if s.get("reached_tp",0)==4),
+            "win_count":len(wins),"loss_count":len(losses),"win_rate":wr,
+            **extra,
         }
-
-        content_b64 = base64.b64encode(
-            json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
-        ).decode("utf-8")
-
-        url = "https://api.github.com/repos/" + GITHUB_REPO + "/contents/data/signals.json"
+        b64 = base64.b64encode(json.dumps(data,ensure_ascii=False,indent=2).encode()).decode()
+        url = "https://api.github.com/repos/"+GITHUB_REPO+"/contents/data/"+filename
         sha = None
         try:
-            req_get = urllib.request.Request(url, headers={
-                "Authorization": "token " + GITHUB_TOKEN,
-                "User-Agent": "sentiment-lens",
-            })
-            with urllib.request.urlopen(req_get, timeout=10) as r:
-                sha = json.loads(r.read()).get("sha")
-        except Exception:
-            pass
-
-        payload = {"message": "update " + tw_now(), "content": content_b64}
-        if sha:
-            payload["sha"] = sha
-
-        req_put = urllib.request.Request(url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": "token " + GITHUB_TOKEN,
-                "Content-Type":  "application/json",
-                "User-Agent":    "sentiment-lens",
-            }, method="PUT")
-        with urllib.request.urlopen(req_put, timeout=20):
-            pass
-        print("  GitHub儲存完成 勝率:" + str(wr) + "% W:" + str(len(wins)) + " L:" + str(len(losses)))
+            req = urllib.request.Request(url,headers={"Authorization":"token "+GITHUB_TOKEN,"User-Agent":"sentiment-lens"})
+            with urllib.request.urlopen(req,timeout=10) as r: sha=json.loads(r.read()).get("sha")
+        except: pass
+        payload = {"message":"update "+filename+" "+tw_now(),"content":b64}
+        if sha: payload["sha"]=sha
+        req2 = urllib.request.Request(url,data=json.dumps(payload).encode(),
+            headers={"Authorization":"token "+GITHUB_TOKEN,"Content-Type":"application/json","User-Agent":"sentiment-lens"},
+            method="PUT")
+        with urllib.request.urlopen(req2,timeout=20): pass
+        print("  GitHub儲存["+filename+"] 勝率:"+str(wr)+"%")
     except Exception as e:
-        print("  GitHub儲存失敗: " + str(e)[:80])
+        print("  GitHub儲存失敗: "+str(e)[:60])
 
 # ═══════════════════════════════════════════════════════════
 # 防休眠
 # ═══════════════════════════════════════════════════════════
 def keep_alive():
-    if not RENDER_URL:
-        return
+    if not RENDER_URL: return
     while True:
         time.sleep(600)
         try:
-            urllib.request.urlopen(RENDER_URL + "/health", timeout=10)
+            urllib.request.urlopen(RENDER_URL+"/health",timeout=10)
             print("  keep-alive OK")
-        except Exception:
-            pass
+        except: pass
 
 # ═══════════════════════════════════════════════════════════
-# 主掃描引擎
+# 波段掃描引擎
 # ═══════════════════════════════════════════════════════════
-def scan_loop():
-    global signals_store, last_update
-    print("=" * 55)
-    print("  Sentiment Lens 掃描引擎啟動")
-    print("=" * 55)
-
-    loaded = github_load()
-    with store_lock:
-        signals_store = loaded
-
-    save_counter = 0
-
+def swing_loop():
+    global swing_store, swing_update
+    print("波段掃描引擎啟動...")
+    with swing_lock: swing_store = gh_load("signals.json")
+    save_cnt = 0
     while True:
         try:
-            print("\n" + "─" * 55)
-            sn, _ = get_session()
-            print(tw_now_full() + " (台北) | " + sn)
-
-            with store_lock:
-                existing = list(signals_store)
-
-            # 清除過期訊號
-            cutoff  = int(time.time()) - SIGNAL_TTL
+            print("\n[波段] "+tw_now_full())
+            with swing_lock: existing = list(swing_store)
+            cutoff  = int(time.time())-SWING_TTL
             updated = []
             for s in existing:
-                if s.get("timestamp", 0) < cutoff:
-                    continue
-                if s.get("active", True) and s.get("result") is None:
-                    s = update_pnl(s)
-                    time.sleep(0.1)
+                if s.get("timestamp",0)<cutoff: continue
+                if s.get("active",True) and s.get("result") is None:
+                    s=update_pnl(s); time.sleep(0.1)
                 updated.append(s)
-
-            # 掃描新訊號
-            new_sigs     = []
-            dedup_cutoff = int(time.time()) - DEDUP_SECONDS
-
-            for name, sym in SYMBOLS:
-                for tf_label, tf_bar in TIMEFRAMES:
-                    # 去重檢查
-                    already = any(
-                        s["symbol"] == name and
-                        s["timeframe"] == tf_label and
-                        s.get("timestamp", 0) > dedup_cutoff
-                        for s in updated
-                    )
-                    if already:
-                        continue
-
-                    sig = analyze(name, sym, tf_label, tf_bar, updated)
-                    if sig:
-                        new_sigs.append(sig)
+            new_sigs=[]; dedup=int(time.time())-SWING_DEDUP
+            for name,sym in SYMBOLS:
+                for tf_label,tf_bar in SWING_TIMEFRAMES:
+                    if any(s["symbol"]==name and s["timeframe"]==tf_label
+                           and s.get("timestamp",0)>dedup for s in updated): continue
+                    sig = analyze_swing(name,sym,tf_label,tf_bar,updated)
+                    if sig: new_sigs.append(sig)
                     time.sleep(0.3)
-
-            all_sigs = new_sigs + updated
-            all_sigs.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
-            all_sigs = all_sigs[:MAX_SIGNALS]
-
-            with store_lock:
-                signals_store = all_sigs
-                last_update   = tw_now_full() + " (台北時間)"
-
-            # 定期存入GitHub
-            save_counter += 1
-            if save_counter >= 10 or len(new_sigs) > 0:
-                github_save(all_sigs)
-                save_counter = 0
-
-            # 統計輸出
-            wins   = sum(1 for s in all_sigs if s.get("result") == "WIN")
-            losses = sum(1 for s in all_sigs if s.get("result") == "LOSS")
-            active = sum(1 for s in all_sigs if s.get("active",True) and not s.get("result"))
-            closed = wins + losses
-            wr     = round(wins/closed*100, 1) if closed > 0 else 0
-            print("新增:" + str(len(new_sigs)) +
-                  " 活躍:" + str(active) +
-                  " 合計:" + str(len(all_sigs)) +
-                  " W:" + str(wins) +
-                  " L:" + str(losses) +
-                  " 勝率:" + str(wr) + "%")
-
+            all_sigs = sorted(new_sigs+updated, key=lambda x:x.get("timestamp",0), reverse=True)[:SWING_MAX]
+            now_str  = tw_now_full()+" (台北時間)"
+            with swing_lock: swing_store=all_sigs; swing_update=now_str
+            save_cnt+=1
+            if save_cnt>=5 or len(new_sigs)>0:
+                gh_save(all_sigs,"signals.json"); save_cnt=0
+            wins=sum(1 for s in all_sigs if s.get("result")=="WIN")
+            losses=sum(1 for s in all_sigs if s.get("result")=="LOSS")
+            closed=wins+losses
+            wr=round(wins/closed*100,1) if closed>0 else 0
+            print("[波段] 新增:"+str(len(new_sigs))+" 合計:"+str(len(all_sigs))+" 勝率:"+str(wr)+"%")
         except Exception as e:
-            print("掃描錯誤: " + str(e))
-
-        time.sleep(SCAN_INTERVAL)
+            print("[波段] 錯誤:"+str(e))
+        time.sleep(SWING_SCAN)
 
 # ═══════════════════════════════════════════════════════════
-# HTTP API 伺服器
+# 日內掃描引擎
 # ═══════════════════════════════════════════════════════════
+def intraday_loop():
+    global intraday_store, intraday_update
+    print("日內掃描引擎啟動...")
+    with intraday_lock: intraday_store = gh_load("intraday_signals.json")
+    save_cnt = 0
+    while True:
+        try:
+            print("\n[日內] "+tw_now_full())
+            with intraday_lock: existing = list(intraday_store)
+            cutoff  = int(time.time())-INTRADAY_TTL
+            updated = []
+            for s in existing:
+                if s.get("timestamp",0)<cutoff: continue
+                if s.get("active",True) and s.get("result") is None:
+                    s=update_pnl(s); time.sleep(0.08)
+                updated.append(s)
+            new_sigs=[]
+            for name,sym in SYMBOLS:
+                for mode_name,entry_bar,ref_bar,dedup_min,min_r,sl_pct in INTRADAY_MODES:
+                    dedup=int(time.time())-dedup_min*60
+                    if any(s["symbol"]==name and s.get("mode")==mode_name
+                           and s.get("timestamp",0)>dedup for s in updated): continue
+                    sig = analyze_intraday(name,sym,mode_name,entry_bar,ref_bar,min_r,sl_pct)
+                    if sig: new_sigs.append(sig)
+                    time.sleep(0.2)
+            all_sigs = sorted(new_sigs+updated, key=lambda x:x.get("timestamp",0), reverse=True)[:INTRADAY_MAX]
+            now_str  = tw_now_full()+" (台北時間)"
+            with intraday_lock: intraday_store=all_sigs; intraday_update=now_str
+            save_cnt+=1
+            if save_cnt>=10 or len(new_sigs)>0:
+                gh_save(all_sigs,"intraday_signals.json"); save_cnt=0
+            wins=sum(1 for s in all_sigs if s.get("result")=="WIN")
+            losses=sum(1 for s in all_sigs if s.get("result")=="LOSS")
+            closed=wins+losses
+            wr=round(wins/closed*100,1) if closed>0 else 0
+            print("[日內] 新增:"+str(len(new_sigs))+" 合計:"+str(len(all_sigs))+" 勝率:"+str(wr)+"%")
+        except Exception as e:
+            print("[日內] 錯誤:"+str(e))
+        time.sleep(INTRADAY_SCAN)
+
+# ═══════════════════════════════════════════════════════════
+# HTTP 伺服器
+# ═══════════════════════════════════════════════════════════
+def make_response(signals, updated_at):
+    wins  = sum(1 for s in signals if s.get("result")=="WIN")
+    losses= sum(1 for s in signals if s.get("result")=="LOSS")
+    closed= wins+losses
+    return {
+        "signals":    signals,
+        "updated_at": updated_at,
+        "total":      len(signals),
+        "active_count": sum(1 for s in signals if s.get("active",True) and not s.get("result")),
+        "ftp_count":  sum(1 for s in signals if s.get("reached_tp",0)==4),
+        "win_count":  wins,
+        "loss_count": losses,
+        "win_rate":   round(wins/closed*100,1) if closed>0 else 0,
+    }
+
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        pass
+    def log_message(self, format, *args): pass
 
     def do_GET(self):
-        if self.path.startswith("/signals") or self.path == "/":
-            with store_lock:
-                wins   = sum(1 for s in signals_store if s.get("result") == "WIN")
-                losses = sum(1 for s in signals_store if s.get("result") == "LOSS")
-                active = sum(1 for s in signals_store if s.get("active",True) and not s.get("result"))
-                closed = wins + losses
-                data   = {
-                    "signals":      signals_store,
-                    "updated_at":   last_update,
-                    "total":        len(signals_store),
-                    "active_count": active,
-                    "ftp_count":    sum(1 for s in signals_store if s.get("reached_tp",0)==4),
-                    "win_count":    wins,
-                    "loss_count":   losses,
-                    "win_rate":     round(wins/closed*100,1) if closed > 0 else 0,
-                }
-            body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Headers", "*")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+        path = self.path.split("?")[0]
 
-        elif self.path == "/health":
+        if path in ["/signals","/"]:
+            with swing_lock:
+                data = make_response(swing_store, swing_update)
+        elif path == "/intraday":
+            with intraday_lock:
+                data = make_response(intraday_store, intraday_update)
+        elif path == "/health":
             self.send_response(200)
-            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Origin","*")
             self.end_headers()
             self.wfile.write(b"ok")
-
+            return
         else:
-            self.send_response(404)
-            self.end_headers()
+            self.send_response(404); self.end_headers(); return
+
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type","application/json; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin","*")
+        self.send_header("Access-Control-Allow-Headers","*")
+        self.send_header("Content-Length",str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_OPTIONS(self):
         self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Access-Control-Allow-Origin","*")
+        self.send_header("Access-Control-Allow-Methods","GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers","*")
         self.end_headers()
 
-class ThreadedServer(socketserver.ThreadingMixIn, HTTPServer):
-    pass
+class ThreadedServer(socketserver.ThreadingMixIn, HTTPServer): pass
 
 # ═══════════════════════════════════════════════════════════
 # 啟動
 # ═══════════════════════════════════════════════════════════
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    threading.Thread(target=scan_loop, daemon=True).start()
-    threading.Thread(target=keep_alive, daemon=True).start()
+    threading.Thread(target=swing_loop,    daemon=True).start()
+    threading.Thread(target=intraday_loop, daemon=True).start()
+    threading.Thread(target=keep_alive,    daemon=True).start()
     server = ThreadedServer(("0.0.0.0", port), Handler)
-    print("API伺服器啟動 port:" + str(port))
+    print("伺服器啟動 port:"+str(port)+" | /signals=波段 | /intraday=日內")
     server.serve_forever()
