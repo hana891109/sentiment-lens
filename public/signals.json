@@ -399,16 +399,16 @@
       "direction": "SHORT",
       "role": "沉思者",
       "trigger": 69213.0,
-      "current": 69443.8,
+      "current": 69880.0,
       "sl": 69511.11428571,
       "risk_pct": 0.43,
       "tp1": 68914.88571429,
       "tp2": 68616.77142857,
       "tp3": 68318.65714286,
       "ftp": 67722.42857143,
-      "pnl": -0.33,
+      "pnl": -0.96,
       "reached_tp": 0,
-      "active": true,
+      "active": false,
       "funding": 0.01,
       "lsr": 1.13,
       "oi": 2801.25,
@@ -1401,6 +1401,6 @@
       "timestamp": 1787158992
     }
   ],
-  "updated_at": "2026/08/19 21:15 UTC",
+  "updated_at": "2026/08/19 21:46 UTC",
   "total": 50
 }
